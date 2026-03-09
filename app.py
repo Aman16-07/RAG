@@ -18,8 +18,11 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image
 
-from src.query import ImageRetriever
-from src.document_rag.qa_pipeline import DocumentQAPipeline
+from src.query import ImageRetriever, ImageQueryReport
+from src.document_rag.qa_pipeline import DocumentQAPipeline, QueryReport
+from src.telemetry import init_telemetry
+
+init_telemetry()
 
 
 st.set_page_config(page_title="Multimodal RAG System", layout="wide")
@@ -100,6 +103,35 @@ tab_images, tab_upload, tab_qa = st.tabs(
 )
 
 
+# ── helpers ───────────────────────────────────────────────────────────────
+
+
+def _show_image_metrics(report: ImageQueryReport) -> None:
+    """Render vector search metrics and latency for an image query."""
+    st.divider()
+    col_vs, col_acc = st.columns(2)
+
+    with col_vs:
+        st.markdown("#### Vector Search")
+        st.write(f"Vectors indexed: **{report.vectors_indexed}**")
+        st.write(f"Top K: **{report.top_k}**")
+        if report.similarity_scores:
+            st.markdown("**Similarity Scores**")
+            for s in report.similarity_scores:
+                st.write(f"{s:.2f}")
+
+    with col_acc:
+        st.markdown("#### Accuracy Score")
+        st.metric("Retrieval confidence", f"{report.accuracy_pct:.1f}%")
+
+    st.divider()
+    st.markdown("#### Latency")
+    lc1, lc2, lc3 = st.columns(3)
+    lc1.metric("Embedding", f"{report.embedding_ms:.0f} ms")
+    lc2.metric("Vector search", f"{report.vector_search_ms:.0f} ms")
+    lc3.metric("Total latency", f"{report.total_ms:.0f} ms")
+
+
 # ── Tab 1: Image Retrieval ────────────────────────────────────────────────
 
 with tab_images:
@@ -125,19 +157,19 @@ with tab_images:
         with sub_text:
             text_query = st.text_input("Describe the car to retrieve", "red sports car")
             if st.button("Search by Text", type="primary"):
-                start = time.perf_counter()
-                results = retriever.search_by_text(text_query, top_k=top_k_images)
-                elapsed_ms = (time.perf_counter() - start) * 1000
+                report = retriever.search_by_text_with_metrics(text_query, top_k=top_k_images)
 
-                st.caption(f"Retrieved {len(results)} results in {elapsed_ms:.1f} ms")
+                st.caption(f"Retrieved {len(report.results)} results in {report.total_ms:.1f} ms")
                 cols = st.columns(3)
-                for idx, result in enumerate(results):
+                for idx, result in enumerate(report.results):
                     with cols[idx % 3]:
                         st.image(
                             result.file_path,
                             caption=f"#{result.rank} | score={result.score:.4f}",
                         )
                         st.code(result.file_path, language=None)
+
+                _show_image_metrics(report)
 
         with sub_image:
             uploaded = st.file_uploader(
@@ -153,19 +185,20 @@ with tab_images:
                     image.save(tmp_path)
 
                 try:
-                    start = time.perf_counter()
-                    results = retriever.search_by_image(tmp_path, top_k=top_k_images)
-                    elapsed_ms = (time.perf_counter() - start) * 1000
-                    st.caption(f"Retrieved {len(results)} results in {elapsed_ms:.1f} ms")
+                    report = retriever.search_by_image_with_metrics(tmp_path, top_k=top_k_images)
+
+                    st.caption(f"Retrieved {len(report.results)} results in {report.total_ms:.1f} ms")
 
                     cols = st.columns(3)
-                    for idx, result in enumerate(results):
+                    for idx, result in enumerate(report.results):
                         with cols[idx % 3]:
                             st.image(
                                 result.file_path,
                                 caption=f"#{result.rank} | score={result.score:.4f}",
                             )
                             st.code(result.file_path, language=None)
+
+                    _show_image_metrics(report)
                 finally:
                     tmp_path.unlink(missing_ok=True)
 
@@ -225,20 +258,44 @@ with tab_qa:
 
     if st.button("Get Answer", type="primary") and question:
         with st.spinner("Searching documents and generating answer..."):
-            start = time.perf_counter()
-            answer, results = doc_pipeline.ask(question, top_k=top_k_docs)
-            elapsed_ms = (time.perf_counter() - start) * 1000
+            report = doc_pipeline.ask_with_metrics(question, top_k=top_k_docs)
 
-        st.caption(f"Answered in {elapsed_ms:.1f} ms")
-
-        st.markdown("### Answer")
-        st.markdown(answer)
-
-        if results:
-            st.divider()
+        # Retrieved context
+        if report.results:
             st.markdown("### Retrieved Context")
-            for r in results:
+            for r in report.results:
                 with st.expander(
-                    f"#{r.rank} | {r.document_source} | score={r.score:.4f}"
+                    f"Chunk {r.rank} | {r.document_source} | score={r.score:.4f}"
                 ):
                     st.markdown(r.text_content)
+
+        # Vector Search metrics
+        st.divider()
+        col_vs, col_acc = st.columns(2)
+
+        with col_vs:
+            st.markdown("### Vector Search")
+            st.write(f"Vectors indexed: **{report.vectors_indexed}**")
+            st.write(f"Top K: **{report.top_k}**")
+            if report.similarity_scores:
+                st.markdown("**Similarity Scores**")
+                for s in report.similarity_scores:
+                    st.write(f"{s:.2f}")
+
+        with col_acc:
+            st.markdown("### Accuracy Score")
+            st.metric("Retrieval confidence", f"{report.accuracy_pct:.1f}%")
+
+        # Latency
+        st.divider()
+        st.markdown("### Latency")
+        lcol1, lcol2, lcol3, lcol4 = st.columns(4)
+        lcol1.metric("Embedding", f"{report.embedding_ms:.0f} ms")
+        lcol2.metric("Vector search", f"{report.vector_search_ms:.0f} ms")
+        lcol3.metric("Answer generation", f"{report.answer_generation_ms:.0f} ms")
+        lcol4.metric("Total latency", f"{report.total_ms:.0f} ms")
+
+        # Final answer
+        st.divider()
+        st.markdown("### Final Answer")
+        st.markdown(report.answer)

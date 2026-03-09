@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 *.npy
+dataset/images/
 faiss_index/*.index
 embeddings/image_metadata.json
 embeddings/manifest.json

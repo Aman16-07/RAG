@@ -18,7 +18,9 @@ A production-quality **Retrieval Augmented Generation** system combining **car i
 7. [Running the Project](#running-the-project)
 8. [Example Queries](#example-queries)
 9. [Performance Optimisation](#performance-optimisation)
-10. [Future Improvements](#future-improvements)
+10. [RAG Evaluation Metrics](#rag-evaluation-metrics)
+11. [Observability with OpenTelemetry](#observability-with-opentelemetry)
+12. [Future Improvements](#future-improvements)
 
 ---
 
@@ -415,6 +417,186 @@ The UI provides three tabs:
 | Document chunk retrieval | < 5 ms |
 | Answer generation (flan-t5-base) | ~200–500 ms (GPU) / ~1–3 s (CPU) |
 | **End-to-end image retrieval** | **< 100 ms** (GPU) |
+
+---
+
+## RAG Evaluation Metrics
+
+Both pipelines expose built-in evaluation metrics so you can monitor retrieval quality and latency at query time.
+
+### Latency Tracking
+
+Every query measures per-stage latency using `time.perf_counter()` and reports it in the Streamlit UI.
+
+**Document Q&A pipeline stages:**
+
+| Stage | What is measured |
+|---|---|
+| Embedding | Time to encode the user query via SentenceTransformer |
+| Vector search | Time for FAISS inner-product search |
+| Answer generation | Time for the LLM to produce an answer from context |
+| Total latency | Wall-clock time for the entire pipeline |
+
+**Image retrieval pipeline stages:**
+
+| Stage | What is measured |
+|---|---|
+| Embedding | Time to encode the text/image query via CLIP |
+| Vector search | Time for FAISS search |
+| Total latency | Wall-clock time end-to-end |
+
+Example output:
+
+```
+Latency
+Embedding:          14 ms
+Vector search:       6 ms
+Answer generation: 180 ms
+Total latency:     200 ms
+```
+
+### Vector Search Metrics
+
+After each query the UI displays:
+
+- **Vectors indexed** – total number of vectors in the FAISS index
+- **Top K** – how many results were requested
+- **Similarity scores** – individual scores for each retrieved result
+
+Example output:
+
+```
+Vector Search
+Vectors indexed: 13
+Top K: 5
+
+Similarity Scores:
+0.86
+0.81
+0.78
+0.74
+0.71
+```
+
+### Accuracy Score
+
+A simple retrieval-confidence metric calculated as:
+
+```
+accuracy = mean(similarity_scores) × 100
+```
+
+This represents how confident the system is that the retrieved chunks are relevant to the query.
+
+Example output:
+
+```
+Accuracy Score: 78.0%
+```
+
+### Answer Generation Pipeline
+
+The document Q&A path follows a clear multi-stage pipeline. The retrieved context is always displayed before the final answer:
+
+```
+User Query
+  → Query embedding
+  → Vector search (FAISS)
+  → Retrieve top-K chunks
+  → Build context
+  → Generate final answer (LLM)
+```
+
+The Streamlit UI shows each stage:
+
+1. **Retrieved Context** – expandable chunks with source and score
+2. **Vector Search** – index size, top-K, similarity scores
+3. **Accuracy Score** – retrieval confidence percentage
+4. **Latency** – per-stage timing breakdown
+5. **Final Answer** – the generated response
+
+### Programmatic Access
+
+Both report types are available as Python dataclasses:
+
+```python
+from src.document_rag.qa_pipeline import DocumentQAPipeline
+
+pipeline = DocumentQAPipeline()
+report = pipeline.ask_with_metrics("What are AEO metrics?", top_k=5)
+
+print(f"Accuracy: {report.accuracy_pct:.1f}%")
+print(f"Embedding: {report.embedding_ms:.0f} ms")
+print(f"Vector search: {report.vector_search_ms:.0f} ms")
+print(f"Answer generation: {report.answer_generation_ms:.0f} ms")
+print(f"Total: {report.total_ms:.0f} ms")
+```
+
+```python
+from src.query import ImageRetriever
+
+retriever = ImageRetriever(...)
+report = retriever.search_by_text_with_metrics("red sports car", top_k=5)
+
+print(f"Accuracy: {report.accuracy_pct:.1f}%")
+for s in report.similarity_scores:
+    print(f"{s:.2f}")
+```
+
+---
+
+## Observability with OpenTelemetry
+
+The system integrates **OpenTelemetry** for distributed tracing and metrics collection across both
+the image and document RAG pipelines.
+
+### Traced spans
+
+Every query produces a hierarchy of spans that can be viewed in any OpenTelemetry-compatible
+backend (Jaeger, Zipkin, Grafana Tempo, etc.):
+
+| Parent span | Child spans | Pipeline |
+|---|---|---|
+| `query_received` | `query_embedding_generation` → `vector_search` → `context_retrieval` → `answer_generation` | Document RAG |
+| `image_text_query` / `image_image_query` | `query_embedding_generation` → `vector_search` | Image RAG |
+| `faiss_document_search` | — | Document retrieval (low-level) |
+
+Each span carries semantic attributes such as `vector_index_size`, `top_k`, `similarity_scores`,
+`results_count`, `context_chunks_count`, `context_tokens`, and stage-level latency.
+
+### Recorded metrics
+
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `rag.doc.query_latency_ms` | Histogram | ms | End-to-end document query latency |
+| `rag.doc.embedding_latency_ms` | Histogram | ms | Query embedding stage |
+| `rag.doc.vector_search_latency_ms` | Histogram | ms | FAISS vector search stage |
+| `rag.doc.answer_generation_latency_ms` | Histogram | ms | LLM answer generation stage |
+| `rag.doc.retrieval_accuracy_percentage` | Histogram | % | Mean similarity × 100 |
+| `rag.doc.vector_index_size` | Histogram | — | Vectors in the FAISS index |
+| `rag.image.query_latency_ms` | Histogram | ms | End-to-end image query latency |
+| `rag.image.embedding_latency_ms` | Histogram | ms | CLIP embedding stage |
+| `rag.image.vector_search_latency_ms` | Histogram | ms | Image FAISS search stage |
+| `rag.image.retrieval_accuracy_percentage` | Histogram | % | Image retrieval accuracy |
+
+### Running with exporters
+
+By default the system uses a **console exporter** (traces and metrics are printed to stdout).
+To send telemetry to an OTLP-compatible collector, set two environment variables before
+launching the app:
+
+```bash
+# Console exporter (default — no extra setup required)
+streamlit run app.py
+
+# OTLP exporter (e.g. Jaeger, Grafana Agent, OpenTelemetry Collector)
+set OTEL_EXPORTER=otlp
+set OTEL_SERVICE_NAME=rag-system
+streamlit run app.py
+```
+
+The OTLP exporter sends to `localhost:4317` by default. Override with the standard
+`OTEL_EXPORTER_OTLP_ENDPOINT` environment variable.
 
 ---
 

@@ -13,6 +13,10 @@ from pathlib import Path
 import faiss
 import numpy as np
 
+from src.telemetry import get_tracer
+
+_tracer = get_tracer("document-retrieval")
+
 
 @dataclass
 class DocumentSearchResult:
@@ -71,23 +75,28 @@ class DocumentIndex:
         if self.index is None or self.index.ntotal == 0:
             return []
 
-        k = min(top_k, self.index.ntotal)
-        scores, indices = self.index.search(query_embedding, k)
+        with _tracer.start_as_current_span("faiss_document_search") as span:
+            k = min(top_k, self.index.ntotal)
+            span.set_attribute("top_k", k)
+            span.set_attribute("vector_index_size", self.index.ntotal)
 
-        results: list[DocumentSearchResult] = []
-        for rank, (score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
-            if idx < 0:
-                continue
-            meta = self.metadata[idx]
-            results.append(
-                DocumentSearchResult(
-                    rank=rank,
-                    score=float(score),
-                    chunk_id=meta["chunk_id"],
-                    document_source=meta["document_source"],
-                    text_content=meta["text_content"],
+            scores, indices = self.index.search(query_embedding, k)
+
+            results: list[DocumentSearchResult] = []
+            for rank, (score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
+                if idx < 0:
+                    continue
+                meta = self.metadata[idx]
+                results.append(
+                    DocumentSearchResult(
+                        rank=rank,
+                        score=float(score),
+                        chunk_id=meta["chunk_id"],
+                        document_source=meta["document_source"],
+                        text_content=meta["text_content"],
+                    )
                 )
-            )
+            span.set_attribute("results_count", len(results))
         return results
 
     # ── helpers ────────────────────────────────────────────────────────

@@ -14,20 +14,48 @@ CLI usage::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import faiss
+import numpy as np
 
 try:  # Supports both `python -m src.query` and `python src/query.py`.
     from src.clip_backend import ClipConfig, ClipEncoder
     from src.faiss_store import load_faiss_index
+    from src.telemetry import get_meter, get_tracer
     from src.utils import load_json
 except ModuleNotFoundError:  # pragma: no cover - script execution fallback
     from clip_backend import ClipConfig, ClipEncoder
     from faiss_store import load_faiss_index
+    from telemetry import get_meter, get_tracer
     from utils import load_json
+
+_tracer = get_tracer("image-rag")
+_meter = get_meter("image-rag")
+
+_img_query_latency_hist = _meter.create_histogram(
+    "rag.image.query_latency_ms",
+    description="Total image query latency in ms",
+    unit="ms",
+)
+_img_embedding_latency_hist = _meter.create_histogram(
+    "rag.image.embedding_latency_ms",
+    description="Image query embedding latency in ms",
+    unit="ms",
+)
+_img_vector_search_latency_hist = _meter.create_histogram(
+    "rag.image.vector_search_latency_ms",
+    description="Image vector search latency in ms",
+    unit="ms",
+)
+_img_retrieval_accuracy = _meter.create_histogram(
+    "rag.image.retrieval_accuracy_percentage",
+    description="Image retrieval accuracy percentage",
+    unit="%",
+)
 
 
 @dataclass
@@ -36,6 +64,24 @@ class RetrievalResult:
     score: float
     file_path: str
     filename: str
+
+
+@dataclass
+class ImageQueryReport:
+    """Evaluation metrics for a single image retrieval query."""
+
+    results: list[RetrievalResult]
+
+    # vector search metrics
+    vectors_indexed: int = 0
+    top_k: int = 0
+    similarity_scores: list[float] = field(default_factory=list)
+    accuracy_pct: float = 0.0
+
+    # latency (milliseconds)
+    embedding_ms: float = 0.0
+    vector_search_ms: float = 0.0
+    total_ms: float = 0.0
 
 
 class ImageRetriever:
@@ -73,6 +119,75 @@ class ImageRetriever:
     def search_by_image(self, image_path: Path, top_k: int = 5) -> list[RetrievalResult]:
         query_vector = self.encoder.encode_query_image(image_path)
         return self._search_vector(query_vector, top_k=top_k)
+
+    # ── metrics-returning search methods ───────────────────────────────
+
+    def search_by_text_with_metrics(self, query: str, top_k: int = 5) -> ImageQueryReport:
+        with _tracer.start_as_current_span("image_text_query", attributes={
+            "query.text": query, "query.top_k": top_k,
+        }):
+            t_total = time.perf_counter()
+
+            with _tracer.start_as_current_span("query_embedding_generation"):
+                t0 = time.perf_counter()
+                query_vector = self.encoder.encode_text(query)
+                embedding_ms = (time.perf_counter() - t0) * 1000
+
+            with _tracer.start_as_current_span("vector_search"):
+                t0 = time.perf_counter()
+                results = self._search_vector(query_vector, top_k=top_k)
+                vector_search_ms = (time.perf_counter() - t0) * 1000
+
+            return self._build_report(results, top_k, embedding_ms, vector_search_ms, t_total)
+
+    def search_by_image_with_metrics(self, image_path: Path, top_k: int = 5) -> ImageQueryReport:
+        with _tracer.start_as_current_span("image_image_query", attributes={
+            "query.image_path": str(image_path), "query.top_k": top_k,
+        }):
+            t_total = time.perf_counter()
+
+            with _tracer.start_as_current_span("query_embedding_generation"):
+                t0 = time.perf_counter()
+                query_vector = self.encoder.encode_query_image(image_path)
+                embedding_ms = (time.perf_counter() - t0) * 1000
+
+            with _tracer.start_as_current_span("vector_search"):
+                t0 = time.perf_counter()
+                results = self._search_vector(query_vector, top_k=top_k)
+                vector_search_ms = (time.perf_counter() - t0) * 1000
+
+            return self._build_report(results, top_k, embedding_ms, vector_search_ms, t_total)
+
+    def _build_report(
+        self,
+        results: list[RetrievalResult],
+        top_k: int,
+        embedding_ms: float,
+        vector_search_ms: float,
+        t_total_start: float,
+    ) -> ImageQueryReport:
+        scores = [r.score for r in results]
+        accuracy_pct = float(np.mean(scores) * 100) if scores else 0.0
+        total_ms = (time.perf_counter() - t_total_start) * 1000
+
+        # Record OTel metrics
+        _img_embedding_latency_hist.record(embedding_ms)
+        _img_vector_search_latency_hist.record(vector_search_ms)
+        _img_query_latency_hist.record(total_ms)
+        _img_retrieval_accuracy.record(accuracy_pct)
+
+        return ImageQueryReport(
+            results=results,
+            vectors_indexed=self.index.ntotal,
+            top_k=top_k,
+            similarity_scores=scores,
+            accuracy_pct=accuracy_pct,
+            embedding_ms=embedding_ms,
+            vector_search_ms=vector_search_ms,
+            total_ms=total_ms,
+        )
+
+    # ── internal ───────────────────────────────────────────────────────
 
     def _search_vector(self, vector, top_k: int) -> list[RetrievalResult]:
         scores, indices = self.index.search(vector, top_k)
